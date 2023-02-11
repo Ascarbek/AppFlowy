@@ -1,3 +1,4 @@
+use crate::services::retry::GetRowDataRetryAction;
 use bytes::Bytes;
 use flowy_client_sync::client_database::{GridBlockRevisionChangeset, GridBlockRevisionPad};
 use flowy_client_sync::make_operations_from_revisions;
@@ -8,6 +9,7 @@ use flowy_revision::{
 use flowy_sqlite::ConnectionPool;
 use grid_model::{CellRevision, DatabaseBlockRevision, RowChangeset, RowRevision};
 use lib_infra::future::FutureResult;
+use lib_infra::retry::spawn_retry;
 use lib_ot::core::EmptyAttributes;
 use revision_model::Revision;
 use std::borrow::Cow;
@@ -53,7 +55,7 @@ impl DatabaseBlockRevisionEditor {
     }
 
     pub async fn duplicate_block(&self, duplicated_block_id: &str) -> DatabaseBlockRevision {
-        self.pad.read().await.duplicate_data(duplicated_block_id).await
+        self.pad.read().await.duplicate_data(duplicated_block_id)
     }
 
     /// Create a row after the the with prev_row_id. If prev_row_id is None, the row will be appended to the list
@@ -116,12 +118,21 @@ impl DatabaseBlockRevisionEditor {
     }
 
     pub async fn get_row_rev(&self, row_id: &str) -> FlowyResult<Option<(usize, Arc<RowRevision>)>> {
-        if self.pad.try_read().is_err() {
-            tracing::error!("Required grid block read lock failed");
-            Ok(None)
+        if let Ok(pad) = self.pad.try_read() {
+            Ok(pad.get_row_rev(row_id))
         } else {
-            let row_rev = self.pad.read().await.get_row_rev(row_id);
-            Ok(row_rev)
+            tracing::error!("Required grid block read lock failed, retrying");
+            let retry = GetRowDataRetryAction {
+                row_id: row_id.to_owned(),
+                pad: self.pad.clone(),
+            };
+            match spawn_retry(3, 300, retry).await {
+                Ok(value) => Ok(value),
+                Err(err) => {
+                    tracing::error!("Read row revision failed with: {}", err);
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -147,10 +158,11 @@ impl DatabaseBlockRevisionEditor {
         F: for<'a> FnOnce(&'a mut GridBlockRevisionPad) -> FlowyResult<Option<GridBlockRevisionChangeset>>,
     {
         let mut write_guard = self.pad.write().await;
-        match f(&mut write_guard)? {
+        let changeset = f(&mut write_guard)?;
+        match changeset {
             None => {}
-            Some(change) => {
-                self.apply_change(change).await?;
+            Some(changeset) => {
+                self.apply_change(changeset).await?;
             }
         }
         Ok(())
@@ -185,7 +197,7 @@ impl RevisionObjectDeserializer for DatabaseBlockRevisionSerde {
         Ok(pad)
     }
 
-    fn recover_operations_from_revisions(_revisions: Vec<Revision>) -> Option<Self::Output> {
+    fn recover_from_revisions(_revisions: Vec<Revision>) -> Option<(Self::Output, i64)> {
         None
     }
 }
